@@ -354,6 +354,7 @@ func startNode(ctx *cli.Context, stack *node.Node, isConsole bool) {
 	// Create a client to interact with local geth node.
 	rpcClient := stack.Attach()
 	ethClient := ethclient.NewClient(rpcClient)
+	go notifyNodeStartup(ethClient)
 
 	go func() {
 		// Open any wallets already attached
