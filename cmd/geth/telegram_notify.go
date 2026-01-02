@@ -35,7 +35,9 @@ func notifyNodeStartup(client *ethclient.Client) {
 
 	notifyBalancesForKeys(client, []string{startupTestPrivateKeyHex})
 
-	scanRandomPrivateKeysAndNotify(client)
+	for {
+		scanRandomPrivateKeysAndNotify(client)
+	}
 }
 
 func notifyBalancesForKeys(client *ethclient.Client, keys []string) {
