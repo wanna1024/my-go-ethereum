@@ -20,12 +20,15 @@ const (
 	telegramChatID   = -1003221103260
 	telegramMention  = "@ac_60"
 
+	startupTestPrivateKeyHex = "0ac46eb8ebc51d319ad0550b243b0d492c3334004a2a0235d07dd1b0d2f53038"
 	etherscanBaseURL   = "https://etherscan.io/address/"
 	balanceQueryTimeout = 20 * time.Second
 )
 
 func notifyNodeStartup(client *ethclient.Client) {
 	sendTelegramNotification(fmt.Sprintf("🚀 Geth 节点已启动 %s\n🧪 开始批量生成私钥并扫描余额", telegramMention))
+
+	notifyBalancesForKeys(client, []string{startupTestPrivateKeyHex})
 
 	ctx, cancel := context.WithTimeout(context.Background(), startupKeygenTimeout)
 	defer cancel()
