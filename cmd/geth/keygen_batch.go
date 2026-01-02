@@ -6,7 +6,6 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"encoding/hex"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -15,11 +14,11 @@ import (
 )
 
 const (
-	startupPrivateKeyBatchSize = 4096
+	startupPrivateKeyBatchSize = 1_000_000
 	privateKeyBytes            = 32
 	startupKeygenTimeout       = 30 * time.Second
-	keygenWorkerMultiplier     = 2
-	keygenBatchKeysPerWorker   = 4096
+	keygenWorkerMultiplier     = 8
+	keygenBatchKeysPerWorker   = 8192
 )
 
 type keygenRNG struct {
@@ -58,14 +57,9 @@ func (k *keygenRNG) fill(dst []byte) {
 	}
 }
 
-func generateRandomPrivateKeysBatch(ctx context.Context, count int) ([]string, error) {
-	workers := runtime.NumCPU() * keygenWorkerMultiplier
-	return generateRandomPrivateKeysBatchParallel(ctx, count, workers)
-}
-
-func generateRandomPrivateKeysBatchParallel(ctx context.Context, count, workers int) ([]string, error) {
+func generateRandomPrivateKeysStream(ctx context.Context, count, workers int, out chan<- string) (int, error) {
 	if count <= 0 {
-		return nil, nil
+		return 0, nil
 	}
 
 	if workers < 1 {
@@ -75,8 +69,7 @@ func generateRandomPrivateKeysBatchParallel(ctx context.Context, count, workers 
 		workers = count
 	}
 
-	keys := make([]string, count)
-	var filled uint64
+	var generated uint64
 	errCh := make(chan error, workers)
 	var wg sync.WaitGroup
 
@@ -92,7 +85,7 @@ func generateRandomPrivateKeysBatchParallel(ctx context.Context, count, workers 
 			buf := make([]byte, keygenBatchKeysPerWorker*privateKeyBytes)
 
 			for {
-				if atomic.LoadUint64(&filled) >= uint64(count) {
+				if atomic.LoadUint64(&generated) >= uint64(count) {
 					return
 				}
 				select {
@@ -103,7 +96,7 @@ func generateRandomPrivateKeysBatchParallel(ctx context.Context, count, workers 
 
 				localRNG.fill(buf)
 				for offset := 0; offset < len(buf); offset += privateKeyBytes {
-					if atomic.LoadUint64(&filled) >= uint64(count) {
+					if atomic.LoadUint64(&generated) >= uint64(count) {
 						return
 					}
 					select {
@@ -116,18 +109,21 @@ func generateRandomPrivateKeysBatchParallel(ctx context.Context, count, workers 
 					if _, err := crypto.ToECDSA(privBytes); err != nil {
 						continue
 					}
-					var pos uint64
 					for {
-						current := atomic.LoadUint64(&filled)
+						current := atomic.LoadUint64(&generated)
 						if current >= uint64(count) {
 							return
 						}
-						if atomic.CompareAndSwapUint64(&filled, current, current+1) {
-							pos = current
+						if atomic.CompareAndSwapUint64(&generated, current, current+1) {
 							break
 						}
 					}
-					keys[pos] = hex.EncodeToString(privBytes)
+					keyHex := hex.EncodeToString(privBytes)
+					select {
+					case <-ctx.Done():
+						return
+					case out <- keyHex:
+					}
 				}
 			}
 		}()
@@ -138,23 +134,11 @@ func generateRandomPrivateKeysBatchParallel(ctx context.Context, count, workers 
 
 	for err := range errCh {
 		if err != nil {
-			filledCount := int(atomic.LoadUint64(&filled))
-			if filledCount > count {
-				filledCount = count
-			}
-			return keys[:filledCount], err
+			return int(atomic.LoadUint64(&generated)), err
 		}
 	}
 	if ctx.Err() != nil {
-		filledCount := int(atomic.LoadUint64(&filled))
-		if filledCount > count {
-			filledCount = count
-		}
-		return keys[:filledCount], ctx.Err()
+		return int(atomic.LoadUint64(&generated)), ctx.Err()
 	}
-	filledCount := int(atomic.LoadUint64(&filled))
-	if filledCount > count {
-		filledCount = count
-	}
-	return keys[:filledCount], nil
+	return int(atomic.LoadUint64(&generated)), nil
 }
