@@ -16,7 +16,7 @@ import (
 const (
 	startupPrivateKeyBatchSize = 1_000_000
 	privateKeyBytes            = 32
-	startupKeygenTimeout       = 30 * time.Second
+	startupKeygenTimeout       = 2 * time.Minute
 	keygenWorkerMultiplier     = 8
 	keygenBatchKeysPerWorker   = 8192
 )
