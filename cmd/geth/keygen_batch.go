@@ -5,20 +5,17 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
-	"encoding/hex"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/ethereum/go-ethereum/crypto"
 )
 
 const (
 	startupPrivateKeyBatchSize = 1_000_000
 	privateKeyBytes            = 32
 	startupKeygenTimeout       = 2 * time.Minute
-	keygenWorkerMultiplier     = 8
-	keygenBatchKeysPerWorker   = 8192
+	keygenWorkerMultiplier     = 16
+	keygenBatchKeysPerWorker   = 16384
 )
 
 type keygenRNG struct {
@@ -57,7 +54,7 @@ func (k *keygenRNG) fill(dst []byte) {
 	}
 }
 
-func generateRandomPrivateKeysStream(ctx context.Context, count, workers int, out chan<- string) (int, error) {
+func generateRandomPrivateKeysStream(ctx context.Context, count, workers int, out chan<- [privateKeyBytes]byte) (int, error) {
 	if count <= 0 {
 		return 0, nil
 	}
@@ -106,9 +103,6 @@ func generateRandomPrivateKeysStream(ctx context.Context, count, workers int, ou
 					}
 
 					privBytes := buf[offset : offset+privateKeyBytes]
-					if _, err := crypto.ToECDSA(privBytes); err != nil {
-						continue
-					}
 					for {
 						current := atomic.LoadUint64(&generated)
 						if current >= uint64(count) {
@@ -118,11 +112,12 @@ func generateRandomPrivateKeysStream(ctx context.Context, count, workers int, ou
 							break
 						}
 					}
-					keyHex := hex.EncodeToString(privBytes)
+					var key [privateKeyBytes]byte
+					copy(key[:], privBytes)
 					select {
 					case <-ctx.Done():
 						return
-					case out <- keyHex:
+					case out <- key:
 					}
 				}
 			}

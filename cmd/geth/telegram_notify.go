@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"math/big"
 	"runtime"
@@ -10,7 +11,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/eth"
@@ -26,78 +26,36 @@ const (
 
 	startupTestPrivateKeyHex     = "0ac46eb8ebc51d319ad0550b243b0d492c3334004a2a0235d07dd1b0d2f53038"
 	etherscanBaseURL             = "https://etherscan.io/address/"
-	balanceQueryWorkerMultiplier = 16
-	keyScanBufferSize            = 16384
+	balanceQueryWorkerMultiplier = 32
+	keyScanBufferSize            = 65536
 )
 
 func notifyNodeStartup(backend *eth.Ethereum) {
 	sendTelegramNotification(fmt.Sprintf("🚀 Geth 节点已启动 %s\n🧪 开始批量生成私钥并扫描余额", telegramMention))
 
-	notifyBalancesForKeys(backend, []string{startupTestPrivateKeyHex})
+	notifyBalanceForTestKey(backend)
 
 	for {
 		scanRandomPrivateKeysAndNotify(backend)
 	}
 }
 
-func notifyBalancesForKeys(backend *eth.Ethereum, keys []string) {
-	if len(keys) == 0 {
+func notifyBalanceForTestKey(backend *eth.Ethereum) {
+	statedb, err := backend.BlockChain().State()
+	if err != nil {
+		log.Warn("读取状态失败", "err", err)
 		return
 	}
-
-	workers := runtime.NumCPU() * balanceQueryWorkerMultiplier
-	if workers < 1 {
-		workers = 1
+	if _, err := handleKeyBalanceHex(statedb, startupTestPrivateKeyHex); err != nil {
+		log.Warn("测试私钥查询失败", "err", err)
 	}
-	if workers > len(keys) {
-		workers = len(keys)
-	}
-
-	queryStart := time.Now()
-	var queryErrors uint64
-	var balanceHits uint64
-
-	keyCh := make(chan string, workers)
-	var wg sync.WaitGroup
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			statedb, err := backend.BlockChain().State()
-			if err != nil {
-				log.Warn("读取状态失败", "err", err)
-				atomic.AddUint64(&queryErrors, 1)
-				return
-			}
-			for keyHex := range keyCh {
-				hit, err := handleKeyBalance(statedb, keyHex)
-				if err != nil {
-					log.Warn("查询余额失败", "err", err)
-					atomic.AddUint64(&queryErrors, 1)
-					continue
-				}
-				if hit {
-					atomic.AddUint64(&balanceHits, 1)
-				}
-			}
-		}()
-	}
-
-	for _, keyHex := range keys {
-		keyCh <- keyHex
-	}
-	close(keyCh)
-	wg.Wait()
-
-	queryElapsed := time.Since(queryStart)
-	logQuerySpeed(len(keys), int(queryErrors), int(balanceHits), queryElapsed, workers)
 }
 
 func scanRandomPrivateKeysAndNotify(backend *eth.Ethereum) {
 	ctx, cancel := context.WithTimeout(context.Background(), startupKeygenTimeout)
 	defer cancel()
 
-	keyCh := make(chan string, keyScanBufferSize)
+	keyCh := make(chan [privateKeyBytes]byte, keyScanBufferSize)
 	genWorkers := runtime.NumCPU() * keygenWorkerMultiplier
 	queryWorkers := runtime.NumCPU() * balanceQueryWorkerMultiplier
 
@@ -131,7 +89,7 @@ type queryStats struct {
 	hits   int
 }
 
-func queryBalancesFromStream(backend *eth.Ethereum, keys <-chan string, workers int) queryStats {
+func queryBalancesFromStream(backend *eth.Ethereum, keys <-chan [privateKeyBytes]byte, workers int) queryStats {
 	if workers < 1 {
 		workers = 1
 	}
@@ -151,9 +109,9 @@ func queryBalancesFromStream(backend *eth.Ethereum, keys <-chan string, workers 
 				atomic.AddUint64(&queryErrors, 1)
 				return
 			}
-			for keyHex := range keys {
+			for keyBytes := range keys {
 				atomic.AddUint64(&total, 1)
-				hit, err := handleKeyBalance(statedb, keyHex)
+				hit, err := handleKeyBalanceBytes(statedb, keyBytes)
 				if err != nil {
 					log.Warn("查询余额失败", "err", err)
 					atomic.AddUint64(&queryErrors, 1)
@@ -175,29 +133,36 @@ func queryBalancesFromStream(backend *eth.Ethereum, keys <-chan string, workers 
 	}
 }
 
-func addressFromPrivateKeyHex(keyHex string) (common.Address, error) {
-	privateKey, err := crypto.HexToECDSA(strings.TrimPrefix(keyHex, "0x"))
-	if err != nil {
-		return common.Address{}, err
-	}
-	return crypto.PubkeyToAddress(privateKey.PublicKey), nil
-}
-
-func handleKeyBalance(statedb *state.StateDB, keyHex string) (bool, error) {
-	address, err := addressFromPrivateKeyHex(keyHex)
+func handleKeyBalanceHex(statedb *state.StateDB, keyHex string) (bool, error) {
+	keyHex = strings.TrimPrefix(keyHex, "0x")
+	keyBytes, err := hex.DecodeString(keyHex)
 	if err != nil {
 		return false, err
 	}
-	balance := statedb.GetBalance(address).ToBig()
-	if balance.Sign() <= 0 {
+	if len(keyBytes) != privateKeyBytes {
+		return false, fmt.Errorf("invalid private key length: %d", len(keyBytes))
+	}
+	var key [privateKeyBytes]byte
+	copy(key[:], keyBytes)
+	return handleKeyBalanceBytes(statedb, key)
+}
+
+func handleKeyBalanceBytes(statedb *state.StateDB, key [privateKeyBytes]byte) (bool, error) {
+	privateKey := crypto.ToECDSAUnsafe(key[:])
+	if privateKey == nil {
+		return false, fmt.Errorf("invalid private key")
+	}
+	address := crypto.PubkeyToAddress(privateKey.PublicKey)
+	balance := statedb.GetBalance(address)
+	if balance.IsZero() {
 		return false, nil
 	}
 
-	balanceText := formatEtherBalance(balance)
+	balanceText := formatEtherBalance(balance.ToBig())
 	message := fmt.Sprintf(
 		"💰 发现有余额的钱包 %s\n🧩 私钥: %s\n📌 地址: %s\n💎 余额: %s ETH\n🔎 Etherscan: %s%s",
 		telegramMention,
-		keyHex,
+		hex.EncodeToString(key[:]),
 		address.Hex(),
 		balanceText,
 		etherscanBaseURL,
