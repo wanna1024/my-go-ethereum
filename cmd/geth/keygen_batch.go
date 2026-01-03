@@ -14,8 +14,8 @@ const (
 	startupPrivateKeyBatchSize = 1_000_000
 	privateKeyBytes            = 32
 	startupKeygenTimeout       = 2 * time.Minute
-	keygenWorkerMultiplier     = 16
-	keygenBatchKeysPerWorker   = 16384
+	keygenWorkerMultiplier     = 32
+	keygenBatchKeysPerWorker   = 32768
 )
 
 type keygenRNG struct {

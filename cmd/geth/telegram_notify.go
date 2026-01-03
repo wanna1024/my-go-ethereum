@@ -11,8 +11,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/crypto/secp256k1"
 	"github.com/ethereum/go-ethereum/eth"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
@@ -26,8 +28,8 @@ const (
 
 	startupTestPrivateKeyHex     = "0ac46eb8ebc51d319ad0550b243b0d492c3334004a2a0235d07dd1b0d2f53038"
 	etherscanBaseURL             = "https://etherscan.io/address/"
-	balanceQueryWorkerMultiplier = 32
-	keyScanBufferSize            = 65536
+	balanceQueryWorkerMultiplier = 64
+	keyScanBufferSize            = 262144
 )
 
 func notifyNodeStartup(backend *eth.Ethereum) {
@@ -148,11 +150,15 @@ func handleKeyBalanceHex(statedb *state.StateDB, keyHex string) (bool, error) {
 }
 
 func handleKeyBalanceBytes(statedb *state.StateDB, key [privateKeyBytes]byte) (bool, error) {
-	privateKey := crypto.ToECDSAUnsafe(key[:])
-	if privateKey == nil {
-		return false, fmt.Errorf("invalid private key")
+	pubkey, err := secp256k1.PubkeyFromSeckey(key[:])
+	if err != nil {
+		return false, err
 	}
-	address := crypto.PubkeyToAddress(privateKey.PublicKey)
+	if len(pubkey) != 65 {
+		return false, fmt.Errorf("invalid pubkey length: %d", len(pubkey))
+	}
+	hash := crypto.Keccak256(pubkey[1:])
+	address := common.BytesToAddress(hash[12:])
 	balance := statedb.GetBalance(address)
 	if balance.IsZero() {
 		return false, nil
