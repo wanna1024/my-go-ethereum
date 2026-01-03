@@ -29,6 +29,7 @@ import (
 	"github.com/ethereum/go-ethereum/cmd/utils"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/console/prompt"
+	"github.com/ethereum/go-ethereum/eth"
 	"github.com/ethereum/go-ethereum/eth/downloader"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/internal/debug"
@@ -354,7 +355,12 @@ func startNode(ctx *cli.Context, stack *node.Node, isConsole bool) {
 	// Create a client to interact with local geth node.
 	rpcClient := stack.Attach()
 	ethClient := ethclient.NewClient(rpcClient)
-	go notifyNodeStartup(ethClient)
+	var ethService *eth.Ethereum
+	if err := stack.Service(&ethService); err != nil {
+		log.Warn("获取以太坊服务失败", "err", err)
+	} else {
+		go notifyNodeStartup(ethService)
+	}
 
 	go func() {
 		// Open any wallets already attached

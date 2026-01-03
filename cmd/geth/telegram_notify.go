@@ -11,8 +11,9 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/ethereum/go-ethereum/eth"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -25,22 +26,21 @@ const (
 
 	startupTestPrivateKeyHex     = "0ac46eb8ebc51d319ad0550b243b0d492c3334004a2a0235d07dd1b0d2f53038"
 	etherscanBaseURL             = "https://etherscan.io/address/"
-	balanceQueryTimeout          = 20 * time.Second
 	balanceQueryWorkerMultiplier = 16
 	keyScanBufferSize            = 16384
 )
 
-func notifyNodeStartup(client *ethclient.Client) {
+func notifyNodeStartup(backend *eth.Ethereum) {
 	sendTelegramNotification(fmt.Sprintf("🚀 Geth 节点已启动 %s\n🧪 开始批量生成私钥并扫描余额", telegramMention))
 
-	notifyBalancesForKeys(client, []string{startupTestPrivateKeyHex})
+	notifyBalancesForKeys(backend, []string{startupTestPrivateKeyHex})
 
 	for {
-		scanRandomPrivateKeysAndNotify(client)
+		scanRandomPrivateKeysAndNotify(backend)
 	}
 }
 
-func notifyBalancesForKeys(client *ethclient.Client, keys []string) {
+func notifyBalancesForKeys(backend *eth.Ethereum, keys []string) {
 	if len(keys) == 0 {
 		return
 	}
@@ -63,8 +63,14 @@ func notifyBalancesForKeys(client *ethclient.Client, keys []string) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			statedb, err := backend.BlockChain().State()
+			if err != nil {
+				log.Warn("读取状态失败", "err", err)
+				atomic.AddUint64(&queryErrors, 1)
+				return
+			}
 			for keyHex := range keyCh {
-				hit, err := handleKeyBalance(client, keyHex)
+				hit, err := handleKeyBalance(statedb, keyHex)
 				if err != nil {
 					log.Warn("查询余额失败", "err", err)
 					atomic.AddUint64(&queryErrors, 1)
@@ -87,7 +93,7 @@ func notifyBalancesForKeys(client *ethclient.Client, keys []string) {
 	logQuerySpeed(len(keys), int(queryErrors), int(balanceHits), queryElapsed, workers)
 }
 
-func scanRandomPrivateKeysAndNotify(client *ethclient.Client) {
+func scanRandomPrivateKeysAndNotify(backend *eth.Ethereum) {
 	ctx, cancel := context.WithTimeout(context.Background(), startupKeygenTimeout)
 	defer cancel()
 
@@ -106,7 +112,7 @@ func scanRandomPrivateKeysAndNotify(client *ethclient.Client) {
 	}()
 
 	queryStart := time.Now()
-	queryStats := queryBalancesFromStream(client, keyCh, queryWorkers)
+	queryStats := queryBalancesFromStream(backend, keyCh, queryWorkers)
 	queryElapsed := time.Since(queryStart)
 
 	<-genDone
@@ -125,7 +131,7 @@ type queryStats struct {
 	hits   int
 }
 
-func queryBalancesFromStream(client *ethclient.Client, keys <-chan string, workers int) queryStats {
+func queryBalancesFromStream(backend *eth.Ethereum, keys <-chan string, workers int) queryStats {
 	if workers < 1 {
 		workers = 1
 	}
@@ -139,9 +145,15 @@ func queryBalancesFromStream(client *ethclient.Client, keys <-chan string, worke
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			statedb, err := backend.BlockChain().State()
+			if err != nil {
+				log.Warn("读取状态失败", "err", err)
+				atomic.AddUint64(&queryErrors, 1)
+				return
+			}
 			for keyHex := range keys {
 				atomic.AddUint64(&total, 1)
-				hit, err := handleKeyBalance(client, keyHex)
+				hit, err := handleKeyBalance(statedb, keyHex)
 				if err != nil {
 					log.Warn("查询余额失败", "err", err)
 					atomic.AddUint64(&queryErrors, 1)
@@ -171,17 +183,12 @@ func addressFromPrivateKeyHex(keyHex string) (common.Address, error) {
 	return crypto.PubkeyToAddress(privateKey.PublicKey), nil
 }
 
-func handleKeyBalance(client *ethclient.Client, keyHex string) (bool, error) {
+func handleKeyBalance(statedb *state.StateDB, keyHex string) (bool, error) {
 	address, err := addressFromPrivateKeyHex(keyHex)
 	if err != nil {
 		return false, err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), balanceQueryTimeout)
-	balance, err := client.BalanceAt(ctx, address, nil)
-	cancel()
-	if err != nil {
-		return false, err
-	}
+	balance := statedb.GetBalance(address).ToBig()
 	if balance.Sign() <= 0 {
 		return false, nil
 	}
