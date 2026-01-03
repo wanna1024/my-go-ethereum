@@ -51,6 +51,8 @@ const (
 )
 
 var (
+	startupEthService *eth.Ethereum
+
 	// flags that configure the node
 	nodeFlags = slices.Concat([]cli.Flag{
 		utils.IdentityFlag,
@@ -355,11 +357,10 @@ func startNode(ctx *cli.Context, stack *node.Node, isConsole bool) {
 	// Create a client to interact with local geth node.
 	rpcClient := stack.Attach()
 	ethClient := ethclient.NewClient(rpcClient)
-	var ethService *eth.Ethereum
-	if err := stack.Service(&ethService); err != nil {
-		log.Warn("获取以太坊服务失败", "err", err)
+	if startupEthService == nil {
+		log.Warn("获取以太坊服务失败", "err", "service not initialized")
 	} else {
-		go notifyNodeStartup(ethService)
+		go notifyNodeStartup(startupEthService)
 	}
 
 	go func() {
